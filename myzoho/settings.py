@@ -25,7 +25,8 @@ SECRET_KEY = 'django-insecure-n(9b@ue85(megd15@x*d4)mvbt(vzf#(j-08=7=zu52p3$@#9x
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ["zohodashbord.onrender.com", "127.0.0.1", "localhost"]
+
 
 CORS_ALLOW_ALL_ORIGINS = True
 
