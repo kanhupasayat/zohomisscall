@@ -1,241 +1,212 @@
 import os
 import json
-import time
 import requests
-import datetime
-import pytz
-import asyncio
-import httpx
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from django.http import StreamingHttpResponse
 from dotenv import load_dotenv
+from django.http import JsonResponse
 
-# Load environment variables
 load_dotenv()
 
-# 🔑 Zoho Credentials
 CLIENT_ID = os.getenv("ZOHO_CLIENT_ID")
 CLIENT_SECRET = os.getenv("ZOHO_CLIENT_SECRET")
 REFRESH_TOKEN = os.getenv("ZOHO_REFRESH_TOKEN")
+
 ACCOUNTS_URL = "https://accounts.zoho.in/oauth/v2/token"
-CRM_API_URL = "https://www.zohoapis.in/crm/v2"
+CRM_URL = "https://www.zohoapis.in/crm/v2/coql"
+MISSCALL_URL = "https://misscall.onrender.com/api/missed-calls/"
 
-# 🔑 Knowlarity Credentials
-X_API_KEY = os.getenv("X_API_KEY")
-AUTHORIZATION_TOKEN = os.getenv("AUTHORIZATION_TOKEN")
-
-# Configure session with retries (for Zoho API)
-session = requests.Session()
-retries = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-session.mount("https://", HTTPAdapter(max_retries=retries))
+ACCESS_TOKEN = None
+BATCH_SIZE = 50   # ek baar me 50 number check
+CACHE_RESULTS = {}   # in-memory cache
 
 
-# --------------------------- ZOHO TOKEN --------------------------- #
+# ---------- Token ----------
 def get_access_token():
-    """Fetch Zoho CRM access token using refresh token."""
-    if not all([CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN]):
-        print("Error: Missing Zoho environment variables")
-        return None
+    global ACCESS_TOKEN
     data = {
         "refresh_token": REFRESH_TOKEN,
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "grant_type": "refresh_token"
     }
-    try:
-        response = session.post(ACCOUNTS_URL, data=data, timeout=(5, 30))
-        response.raise_for_status()
-        return response.json().get("access_token")
-    except requests.exceptions.RequestException as e:
-        print(f"Error generating access token: {e}")
+    resp = requests.post(ACCOUNTS_URL, data=data)
+    if resp.status_code != 200:
         return None
+    ACCESS_TOKEN = resp.json().get("access_token")
+    return ACCESS_TOKEN
 
 
-# --------------------------- KNOWLARITY (ASYNC FETCH) --------------------------- #
-async def fetch_page(client, url, headers, params):
-    """Fetch a single page of call logs."""
+def request_with_auto_retry(url, headers, payload=None):
+    """Zoho API call retry with refresh"""
+    global ACCESS_TOKEN
+    resp = requests.post(url, headers=headers, data=json.dumps(payload) if payload else None)
+    if resp.status_code == 401:  # token expire
+        ACCESS_TOKEN = get_access_token()
+        if not ACCESS_TOKEN:
+            return None
+        headers["Authorization"] = f"Zoho-oauthtoken {ACCESS_TOKEN}"
+        resp = requests.post(url, headers=headers, data=json.dumps(payload) if payload else None)
+    return resp
+
+
+# ---------- Missed Call ----------
+def fetch_missed_call_numbers():
     try:
-        response = await client.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        return response.json()
-    except httpx.HTTPError as e:
-        print(f"[ERROR] Fetching page failed: {e}")
-        return None
-
-
-async def get_all_call_logs(url, headers, start_time, end_time, limit=500):
-    """Fetch all call logs concurrently (fast)."""
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        # Get first page (to know total count)
-        params = {'start_time': start_time, 'end_time': end_time, 'limit': limit, 'offset': 0}
-        initial_data = await fetch_page(client, url, headers, params)
-        if not initial_data:
+        response = requests.get(MISSCALL_URL)
+        if response.status_code == 200:
+            data = response.json()
+            calls = data.get("unattended_missed_calls", [])
+            numbers = [call["customer_number"].replace("+", "") for call in calls]
+            return numbers
+        else:
+            print(f"Error: {response.status_code}")
             return []
-
-        total_count = initial_data.get('meta', {}).get('total_count', 0)
-        if total_count == 0:
-            return []
-
-        tasks = [
-            fetch_page(client, url, headers, {
-                'start_time': start_time,
-                'end_time': end_time,
-                'limit': limit,
-                'offset': offset
-            }) for offset in range(0, total_count, limit)
-        ]
-
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        all_calls = [call for result in results if result for call in result.get('objects', [])]
-        return all_calls
-
-
-def fetch_phone_numbers():
-    """Fetch unattended missed calls from Knowlarity (last 48 hours)."""
-    try:
-        india_tz = pytz.timezone('Asia/Kolkata')
-        now = datetime.datetime.now(india_tz)
-        start_time = (now - datetime.timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%S")
-        end_time = now.strftime("%Y-%m-%dT%H:%M:%S")
-
-        url = 'https://kpi.knowlarity.com/Basic/v1/account/calllog'
-        headers = {
-            'x-api-key': X_API_KEY,
-            'authorization': AUTHORIZATION_TOKEN,
-            'content-type': "application/json",
-        }
-
-        all_calls = asyncio.run(get_all_call_logs(url, headers, start_time, end_time))
-        if not all_calls:
-            return []
-
-        # Sort by time
-        all_calls.sort(key=lambda x: x.get('start_time', ''))
-
-        attended_calls, unattended_missed_calls = {}, []
-
-        for call in all_calls:
-            agent, customer, call_time = call.get('agent_number', ''), call.get('customer_number', ''), call.get('start_time', '')
-            if customer and agent not in ['Call Missed', 'NA', '', None]:
-                attended_calls[customer] = max(call_time, attended_calls.get(customer, ''))
-
-        for call in all_calls:
-            agent, customer, call_time = call.get('agent_number', ''), call.get('customer_number', ''), call.get('start_time', '')
-            if customer and agent in ['Call Missed', 'NA']:
-                if call_time > attended_calls.get(customer, ''):
-                    unattended_missed_calls.append({
-                        "phone": customer.lstrip('+'),
-                        "time": call_time
-                    })
-
-        return unattended_missed_calls
-
     except Exception as e:
-        print(f"Error fetching phone numbers: {e}")
+        print("Request failed:", e)
         return []
 
 
-# --------------------------- ZOHO HELPERS --------------------------- #
-def search_records(module, phone_number, access_token):
-    """Search Zoho CRM for records by phone number."""
-    url = f"{CRM_API_URL}/{module}/search?phone={phone_number}"
-    headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
-    try:
-        response = session.get(url, headers=headers, timeout=(5, 30))
-        response.raise_for_status()
-        return response.json().get("data", [])
-    except requests.exceptions.RequestException as e:
-        print(f"Error in {module} search (phone: {phone_number}): {e}")
-        return []
+# ---------- Helper ----------
+def chunk_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 
-def get_owner_name(record):
-    """Extract owner name based on record type and stage."""
-    deal_exists = record.get("Deal_Name") is not None
-    owner_name = record.get("Owner", {}).get("name", "Unknown")
+# ---------- Main Logic ----------
+def check_lead_or_deal(phone_numbers):
+    headers = {
+        "Authorization": f"Zoho-oauthtoken {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
 
-    if not deal_exists:
-        return f"Lead Owner: {owner_name}"
+    found_number = {}
+    unknown_number = set()
+    plan_slipped_numbers = set()
+    consultation_done = set()
+    plan_delivered_numbers = {}
 
-    stage = (record.get("Stage") or "").strip()
-    if stage == "Consultation Done":
-        return f"Deal Owner: {owner_name}"
-    elif stage == "Plan Shipped":
-        return "Delivery related - No Owner"
-    elif stage in ["Plan Delivered", "Plan  Delivered"]:
-        raaz_mitra = record.get("Raaz_Mitra")
-        return f"Raaz Mitra: {raaz_mitra}" if raaz_mitra else f"Raaz Mitra Missing (Deal Owner: {owner_name})"
+    leads_found = set()
 
-    return f"Deal Owner: {owner_name}"
+    # ✅ Sirf naye numbers hi Zoho se check karna hai
+    new_numbers = [num for num in phone_numbers if num not in CACHE_RESULTS]
+
+    # ---------- Leads ----------
+    for batch in chunk_list(new_numbers, BATCH_SIZE):
+        phone_list = ",".join([f"'{num}'" for num in batch])
+        query = {
+            "select_query": f"""
+                select Full_Name, Owner, Phone
+                from Leads
+                where Phone in ({phone_list})
+            """
+        }
+        resp_lead = request_with_auto_retry(CRM_URL, headers, query)
+        if resp_lead and resp_lead.status_code == 200:
+            data = resp_lead.json()
+            if data.get("data"):
+                for rec in data["data"]:
+                    phone = rec.get("Phone")
+                    leads_found.add(phone)
+                    name = rec.get("Full_Name", "Unknown")
+                    owner_id = rec.get("Owner", {}).get("id")
+                    owner_name = {
+                        "570692000000284001": "Akash Kumar",
+                        "570692000000696001": "Dr. Harshit Kukreja",
+                        "570692000001303016": "Rahul Namdeo",
+                        "570692000015545001": "Rashid Hussain",
+                        "570692000021553001": "Sahil Kumar",
+                        "570692000021084001": "Team",
+                        "570692000034410001": "Kuntal Ghosh",
+                        "570692000064235701": "Alam Uddin",
+                        "570692000031980001": "Suraj Giri",
+                        "570692000003887001": "Sudhanshu Kumar",
+                        "570692000015618001": "Vicky Routh",
+                        "570692000034206008": "deep roy",
+                        "570692000001307001": "Sonu Giri",
+                        "570692000031974020": "Himanshu Goswami",
+                        "570692000034410024": "Sourav Mondal",
+                        "570692000064235703": "Sourav Mondal",
+                        "570692000062859037": "Aman Ul Nawaz",
+                        "570692000031974043": "Prince Kumar",
+                        "570692000022523001": "Naresh Prajapati",
+                        "570692000011216042": "Sumit Raghuwanshi",
+                        "570692000062919131": "Fozlur Rahman",
+                        "570692000017587001": "Kanhu Pasayat"
+                    }.get(owner_id, f"Unknown ({owner_id})")
+
+                    CACHE_RESULTS[phone] = {"type": "lead", "name": name, "owner": owner_name}
+
+    # ---------- Deals ----------
+    remaining_numbers = [num for num in new_numbers if num not in leads_found]
+
+    for batch in chunk_list(remaining_numbers, BATCH_SIZE):
+        phone_list_remaining = ",".join([f"'{num}'" for num in batch])
+        query = {
+            "select_query": f"""
+                select Deal_Name, Stage, Phone, Raaz_Mitra, Owner
+                from Deals
+                where Phone in ({phone_list_remaining})
+                order by Created_Time desc
+            """
+        }
+        resp_deal = request_with_auto_retry(CRM_URL, headers, query)
+        if resp_deal and resp_deal.status_code == 200:
+            data = resp_deal.json()
+            if data.get("data"):
+                for rec in data["data"]:
+                    phone = rec.get("Phone")
+                    stage = rec.get("Stage")
+
+                    if stage == "Plan Shipped":
+                        CACHE_RESULTS[phone] = {"type": "plan_slipped"}
+
+                    elif stage and stage.strip().lower() == "consultation done":
+                        CACHE_RESULTS[phone] = {"type": "consultation_done"}
+
+                    elif stage == "Plan  Delivered":
+                        CACHE_RESULTS[phone] = {
+                            "type": "plan_delivered",
+                            "Raaz_Mitra": rec.get("Raaz_Mitra") or "None"
+                        }
+
+    # ---------- Cached Results load ----------
+    for num in phone_numbers:
+        result = CACHE_RESULTS.get(num)
+        if result:
+            if result["type"] == "lead":
+                found_number[num] = {"name": result["name"], "owner": result["owner"]}
+
+            elif result["type"] == "plan_slipped":
+                plan_slipped_numbers.add(num)
+
+            elif result["type"] == "consultation_done":
+                consultation_done.add(num)
+
+            elif result["type"] == "plan_delivered":
+                raaz_mitra = result.get("Raaz_Mitra", "None")
+                if raaz_mitra not in plan_delivered_numbers:
+                    plan_delivered_numbers[raaz_mitra] = set()
+                plan_delivered_numbers[raaz_mitra].add(num)
+
+        else:
+            unknown_number.add(num)
+
+    # ✅ Convert sets back to list before returning
+    return {
+        "leads": found_number,
+        "plan_slipped": list(plan_slipped_numbers),
+        "consultation_done": list(consultation_done),
+        "plan_delivered": {k: list(v) for k, v in plan_delivered_numbers.items()},
+        "unknown": list(unknown_number)
+    }
 
 
-# --------------------------- STREAMING RESPONSE --------------------------- #
-def fetch_zoho_data_stream(request):
-    """SSE streaming response with Zoho CRM data and Knowlarity numbers."""
-    def stream():
-        try:
-            yield f"event: heartbeat\ndata: {json.dumps({'message': 'Connected'})}\n\n"
+# ---------- Django View ----------
+def check_numbers_view(request):
+    global ACCESS_TOKEN
+    ACCESS_TOKEN = get_access_token()
+    if not ACCESS_TOKEN:
+        return JsonResponse({"error": "Could not generate access token"}, status=400)
 
-            access_token = get_access_token()
-            if not access_token:
-                yield f"data: {json.dumps({'error': 'Cannot generate access token'})}\n\n"
-                return
-
-            phone_numbers = fetch_phone_numbers()
-            if not phone_numbers:
-                yield f"data: {json.dumps({'error': 'No phone numbers retrieved'})}\n\n"
-                return
-
-            # Process in batches for speed
-            chunk_size = 15
-            for i in range(0, len(phone_numbers), chunk_size):
-                batch = phone_numbers[i:i + chunk_size]
-                batch_result = []
-
-                for entry in batch:
-                    phone, entry_time = entry["phone"], entry["time"]
-
-                    # ✅ Convert entry_time into IST Date + Time
-                    try:
-                        entry_dt = datetime.datetime.fromisoformat(entry_time.replace("Z", "+00:00"))
-                        india_tz = pytz.timezone('Asia/Kolkata')
-                        entry_dt = entry_dt.astimezone(india_tz)
-
-                        mis_date = entry_dt.strftime("%Y-%m-%d")   # only date
-                        mis_time = entry_dt.strftime("%H:%M:%S")   # only time
-                    except Exception:
-                        mis_date, mis_time = "N/A", entry_time
-
-                    # ✅ Search Zoho records
-                    leads = search_records("Leads", phone, access_token)
-                    deals = search_records("Deals", phone, access_token)
-                    all_records = leads + deals
-
-                    if all_records:
-                        latest_record = max(all_records, key=lambda x: x.get("Created_Time", "1970-01-01T00:00:00Z"))
-                        owner = get_owner_name(latest_record)
-                    else:
-                        owner = None
-
-                    # ✅ Final JSON result
-                    batch_result.append({
-                        "phone": phone,
-                        "mis_date": mis_date,
-                        "mis_time": mis_time,
-                        "owner": owner
-                    })
-
-                yield f"data: {json.dumps(batch_result)}\n\n"
-                time.sleep(0.05)  # lighter delay (faster)
-
-            yield f"event: end\ndata: {json.dumps({'message': 'Stream finished'})}\n\n"
-
-        except Exception as e:
-            print(f"Unexpected error in stream: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-    response = StreamingHttpResponse(stream(), content_type='text/event-stream')
-    response['Cache-Control'] = 'no-cache'
-    response['Access-Control-Allow-Origin'] = '*'
-    return response
+    phone_numbers = fetch_missed_call_numbers()
+    result = check_lead_or_deal(phone_numbers)
+    return JsonResponse(result, safe=False)

@@ -1,7 +1,6 @@
 from django.urls import path
-from . import views
+from .views import check_numbers_view
 
 urlpatterns = [
-    path('fetch-zoho/', views.fetch_zoho_data_stream, name='fetch_zoho_data_stream'),
-    
+    path("check-numbers/", check_numbers_view, name="check_numbers"),
 ]

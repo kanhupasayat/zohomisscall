@@ -78,6 +78,14 @@ WSGI_APPLICATION = 'myzoho.wsgi.application'
 
 
 
+
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
+        'LOCATION': 'C:/var/tmp/django_cache',  # Forward slash ya backslash dono kaam karenge
+    }
+}
+
 # Database
 # https://docs.djangoproject.com/en/5.2/ref/settings/#databases
 
